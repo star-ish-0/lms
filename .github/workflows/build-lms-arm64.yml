@@ -1,61 +1,392 @@
-name: Build LMS for ARM64
+# ─────────────────────────────────────────────────────────────────────────────
+#  LMS — Build ARM64 para Termux / Proot-distro Debian
+# ─────────────────────────────────────────────────────────────────────────────
+#  Gera um tarball pronto para extrair no proot-distro Debian (Termux/Android).
+#
+#  Estratégia:
+#    • Runner ubuntu-latest (x86_64) com QEMU para emular ARM64
+#    • Container debian:trixie arm64 para compilar Wt4 e o LMS
+#    • Wt4 é cacheado entre runs (~30-60 min na 1ª execução, <1 min depois)
+#    • Libs do Wt4 são incluídas no tarball (não estão nos repos Debian)
+#    • Wrapper `lms-run` configura LD_LIBRARY_PATH automaticamente
+#
+#  Artefato gerado: lms-arm64-debian-trixie.tar.gz
+#    Extrair em / dentro do proot-distro para instalar em /usr/local/
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: 📦 LMS — ARM64 · Termux / Proot-distro Debian
 
 on:
-  workflow_dispatch: # Permite iniciar manualmente pela aba Actions
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Tipo de build"
+        required: false
+        default: "Release"
+        type: choice
+        options: [Release, Debug]
+
+env:
+  # Wt4: não está nos repositórios Debian — compilado do fonte e cacheado
+  WT_VERSION:       "4.11.1"
+  DEBIAN_CODENAME:  "trixie"
+  BUILD_TYPE:       ${{ inputs.build_type || 'Release' }}
+  # Prefixo de instalação dentro do proot-distro Debian
+  PREFIX:           "/usr/local"
 
 jobs:
-  build:
+  build-arm64:
+    name: 🏗️ ARM64 · Debian Trixie
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repositório
+
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: ⬇️ Checkout
         uses: actions/checkout@v4
 
-      - name: Compilar no container Debian ARM64 emulado
-        uses: uraimo/run-on-arch-action@v3
+      # ── 2. QEMU para emulação ARM64 no runner x86_64 ──────────────────────
+      - name: 🖥️ QEMU — habilitar emulação ARM64
+        uses: docker/setup-qemu-action@v3
         with:
-          arch: aarch64
-          distro: bookworm
-          githubToken: ${{ github.token }}
-          setup: |
-            mkdir -p "${PWD}/artifacts"
-          dockerRunArgs: |
-            --volume "${PWD}/artifacts:/artifacts"
-          run: |
-            # Instalar ferramentas e bibliotecas de desenvolvimento no Debian emulado
-            apt-get update && apt-get install -y \
-              build-essential cmake git libboost-program-options-dev \
-              libboost-system-dev libboost-thread-dev libboost-filesystem-dev \
-              libboost-date-time-dev libavutil-dev libavformat-dev libswresample-dev \
-              ffmpeg libconfig++-dev libstb-dev libtag-dev libpugixml-dev \
-              libgtest-dev libarchive-dev libxxhash-dev libssl-dev zlib1g-dev \
-              libgraphicsmagick++1-dev libpstreams-dev
+          platforms: linux/arm64
 
-            # 1. Compilar Wt4
-            git clone --depth 1 https://github.com/emweb/wt.git
-            cd wt
-            mkdir build_wt && cd build_wt
-            cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DSHARED_LIBS=ON
-            make -j$(nproc)
-            make install
-            ldconfig
-            cd ../.. && rm -rf wt
+      # ── 3. Cache do Wt4 compilado ─────────────────────────────────────────
+      #  Chave inclui versão, distro e arquitetura.
+      #  Incremente o sufixo (v1→v2) para forçar rebuild do Wt4.
+      - name: 📦 Cache — Wt4 ${{ env.WT_VERSION }}
+        id: cache-wt4
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/wt4-install
+          key: wt4-${{ env.WT_VERSION }}-debian-${{ env.DEBIAN_CODENAME }}-arm64-v1
+          restore-keys: |
+            wt4-${{ env.WT_VERSION }}-debian-${{ env.DEBIAN_CODENAME }}-arm64-
 
-            # 2. Compilar LMS
-            git clone https://github.com/epoupon/lms.git
-            cd lms
-            mkdir build_lms && cd build_lms
-            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_UNITY_BUILD=ON -DCMAKE_INSTALL_PREFIX=/usr
-            make -j$(nproc)
-            
-            # Instalar em um diretório temporário para gerar o pacote
-            mkdir -p /tmp/lms-package
-            make install DESTDIR=/tmp/lms-package
-            
-            # Gerar tarball mantendo a estrutura de pastas do sistema (/usr/bin, /usr/share, /etc...)
-            tar -czvf /artifacts/lms-arm64.tar.gz -C /tmp/lms-package .
+      # ── 4. Compilar Wt4 (somente se não estiver em cache) ─────────────────
+      #  ⚠️  Na 1ª execução isso leva ~30-60 min (emulação ARM64 via QEMU).
+      #  Nas execuções seguintes o cache é restaurado em segundos.
+      - name: 🔨 Compilar Wt4 ${{ env.WT_VERSION }} (se não estiver em cache)
+        if: steps.cache-wt4.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "${{ github.workspace }}/wt4-install"
 
-      - name: Fazer upload do binário compilado
+          # Escreve o script de build para um arquivo temporário para evitar
+          # problemas de quoting entre o shell do runner e o shell do container.
+          cat > /tmp/build-wt4.sh << 'SHEOF'
+          #!/usr/bin/env bash
+          set -eux -o pipefail
+
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build wget ca-certificates \
+            libboost-dev libboost-program-options-dev libboost-thread-dev \
+            libssl-dev libsqlite3-dev zlib1g-dev
+
+          # Baixar e extrair o fonte do Wt4
+          cd /tmp
+          wget -q "https://github.com/emweb/wt/archive/refs/tags/${WT_VERSION}.tar.gz" \
+            -O wt.tar.gz
+          tar xf wt.tar.gz
+
+          # Configurar: apenas connector HTTP + Dbo/DboSqlite3, sem exemplos/testes
+          cmake -S "wt-${WT_VERSION}" -B wt-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/wt \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_EXAMPLES=OFF \
+            -DBUILD_TESTS=OFF \
+            -DENABLE_LIBWTTEST=OFF \
+            -DENABLE_LIBWTWITHNODE=OFF \
+            -DCONNECTOR_FCGI=OFF \
+            -DCONNECTOR_HTTP=ON \
+            -DWT_WRASTERIMAGE_IMPLEMENTATION=none \
+            -DENABLE_PANGO=OFF \
+            -DENABLE_QT4=OFF \
+            -DENABLE_QT5=OFF \
+            -DENABLE_QT6=OFF
+
+          ninja -C wt-build -j$(nproc) install
+
+          echo "✅ Wt4 ${WT_VERSION} instalado em /opt/wt"
+          ls /opt/wt/lib/libWt*.so* 2>/dev/null || ls /opt/wt/lib/
+          SHEOF
+
+          chmod +x /tmp/build-wt4.sh
+
+          docker run --rm --platform linux/arm64 \
+            --env WT_VERSION="${{ env.WT_VERSION }}" \
+            -v "${{ github.workspace }}/wt4-install:/opt/wt" \
+            -v "/tmp/build-wt4.sh:/build-wt4.sh:ro" \
+            debian:${{ env.DEBIAN_CODENAME }} \
+            bash /build-wt4.sh
+
+      # ── 5. Compilar LMS ───────────────────────────────────────────────────
+      - name: 🎵 Compilar LMS (${{ env.BUILD_TYPE }})
+        run: |
+          mkdir -p "${{ github.workspace }}/output"
+
+          cat > /tmp/build-lms.sh << 'SHEOF'
+          #!/usr/bin/env bash
+          set -eux -o pipefail
+
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build \
+            libboost-program-options-dev libboost-system-dev \
+            libavutil-dev libavformat-dev libswresample-dev ffmpeg \
+            libconfig++-dev libstb-dev libtag-dev libpugixml-dev \
+            libarchive-dev libxxhash-dev libssl-dev libsqlite3-dev \
+            libgtest-dev zlib1g-dev libpam0g-dev
+
+          # Configurar LMS
+          cmake -S /src -B /tmp/lms-build -G Ninja \
+            -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+            -DCMAKE_UNITY_BUILD=ON \
+            -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+            -DCMAKE_PREFIX_PATH=/opt/wt \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_BENCHMARKS=OFF
+
+          ninja -C /tmp/lms-build -j$(nproc)
+
+          # Instala em /output usando DESTDIR
+          # → binário em /output/usr/local/bin/lms
+          # → assets em /output/usr/local/share/lms/
+          DESTDIR=/output cmake --install /tmp/lms-build
+
+          # ── Bundle das libs do Wt4 ─────────────────────────────────────
+          # Wt4 não está nos repositórios Debian, então inclui as .so no pacote.
+          mkdir -p "/output${PREFIX}/lib/wt"
+          find /opt/wt/lib -maxdepth 1 \
+            \( -name 'libWt*.so*' -o -name 'libwt*.so*' \) \
+            -exec cp -a {} "/output${PREFIX}/lib/wt/" \;
+
+          # Recursos do Wt necessários em runtime (JS/CSS do framework)
+          mkdir -p "/output${PREFIX}/share/Wt"
+          cp -r /opt/wt/share/Wt/resources "/output${PREFIX}/share/Wt/"
+
+          # ── Diagnóstico ───────────────────────────────────────────────
+          echo ""
+          echo "=== Binário gerado ==="
+          file   "/output${PREFIX}/bin/lms"
+          ls  -lh "/output${PREFIX}/bin/lms"
+          echo ""
+          echo "=== Dependências dinâmicas ==="
+          LD_LIBRARY_PATH="/opt/wt/lib" ldd "/output${PREFIX}/bin/lms"
+          echo ""
+          echo "=== Libs Wt4 incluídas no pacote ==="
+          ls -lh "/output${PREFIX}/lib/wt/"
+          SHEOF
+
+          chmod +x /tmp/build-lms.sh
+
+          docker run --rm --platform linux/arm64 \
+            --env BUILD_TYPE="${{ env.BUILD_TYPE }}" \
+            --env PREFIX="${{ env.PREFIX }}" \
+            -v "${{ github.workspace }}:/src:ro" \
+            -v "${{ github.workspace }}/wt4-install:/opt/wt:ro" \
+            -v "${{ github.workspace }}/output:/output" \
+            -v "/tmp/build-lms.sh:/build-lms.sh:ro" \
+            debian:${{ env.DEBIAN_CODENAME }} \
+            bash /build-lms.sh
+
+      # ── 6. Gerar arquivos de suporte para Termux ──────────────────────────
+      - name: 📝 Gerar arquivos de suporte para Termux
+        run: |
+          PREFIX="${{ env.PREFIX }}"
+          OUT="${{ github.workspace }}/output"
+          SHARE="${OUT}${PREFIX}/share/lms"
+          BIN="${OUT}${PREFIX}/bin"
+
+          # ── a) Wrapper de inicialização ─────────────────────────────────
+          # Injeta LD_LIBRARY_PATH para as libs do Wt4 incluídas no pacote.
+          # O usuário chama `lms-run` em vez de `lms` diretamente.
+          cat > "${BIN}/lms-run" << 'WRAPPER'
+          #!/usr/bin/env bash
+          # Inicializador do LMS — carrega automaticamente as libs Wt4 bundled.
+          # Uso: lms-run --config /etc/lms.conf
+          export LD_LIBRARY_PATH="/usr/local/lib/wt${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec /usr/local/bin/lms "$@"
+          WRAPPER
+          chmod +x "${BIN}/lms-run"
+
+          # ── b) Config ajustada para o ambiente Termux/proot-distro ──────
+          # Corrige os paths para os que serão válidos dentro do proot Debian.
+          sed \
+            -e "s|wt-resources = .*|wt-resources = \"${PREFIX}/share/Wt/resources\";|" \
+            -e "s|docroot = .*|docroot = \"${PREFIX}/share/lms/docroot;/resources,/css,/images,/js,/favicon.ico\";|" \
+            -e "s|approot = .*|approot = \"${PREFIX}/share/lms/approot\";|" \
+            -e "s|working-dir = .*|working-dir = \"/var/lms\";|" \
+            -e "s|ffmpeg-file = .*|ffmpeg-file = \"/usr/bin/ffmpeg\";|" \
+            "${SHARE}/lms.conf" > "${SHARE}/lms-termux.conf"
+
+          # ── c) Script de instalação de dependências de runtime ──────────
+          cat > "${SHARE}/termux-install-deps.sh" << 'DEPS'
+          #!/usr/bin/env bash
+          # Instala as dependências de runtime do LMS no proot-distro Debian.
+          #
+          # Execute dentro do proot como root:
+          #   proot-distro login debian
+          #   bash /usr/local/share/lms/termux-install-deps.sh
+          set -e
+
+          echo "🔄 Atualizando repositórios..."
+          apt-get update -qq
+
+          echo "📦 Instalando dependências de runtime..."
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libboost-program-options-dev \
+            libboost-system-dev \
+            libavutil-dev libavformat-dev libswresample-dev \
+            ffmpeg \
+            libconfig++-dev \
+            libpugixml-dev \
+            libarchive-dev \
+            libxxhash-dev \
+            libssl-dev \
+            libsqlite3-dev \
+            zlib1g \
+            libtag-dev \
+            libpam0g
+
+          echo ""
+          echo "✅ Dependências instaladas com sucesso!"
+          echo "   Próximo passo: extraia o pacote e execute lms-run."
+          DEPS
+          chmod +x "${SHARE}/termux-install-deps.sh"
+
+          # ── d) README de instalação ─────────────────────────────────────
+          cat > "${OUT}/README-TERMUX.md" << 'README'
+          # LMS · ARM64 — Termux / Proot-distro Debian
+
+          Servidor de streaming de música auto-hospedado compilado para
+          `aarch64-linux-gnu` com base no **Debian Trixie**.
+
+          ---
+
+          ## Pré-requisitos (no Termux)
+
+          ```bash
+          pkg update && pkg install proot-distro
+          proot-distro install debian
+          ```
+
+          ---
+
+          ## Instalação passo a passo
+
+          ### 1. Instalar dependências de runtime
+
+          ```bash
+          # Entre no proot-distro Debian
+          proot-distro login debian
+
+          # Instale as dependências (como root, dentro do proot)
+          bash /usr/local/share/lms/termux-install-deps.sh
+          ```
+
+          ### 2. Copiar e extrair o pacote
+
+          Transfira o arquivo `.tar.gz` para o dispositivo
+          (via Termux, `adb push`, ou similar), depois:
+
+          ```bash
+          # Ainda dentro do proot Debian:
+          tar xzf /caminho/para/lms-arm64-debian-trixie.tar.gz -C /
+          ```
+
+          ### 3. Criar o diretório de dados e configurar
+
+          ```bash
+          mkdir -p /var/lms
+          cp /usr/local/share/lms/lms-termux.conf /etc/lms.conf
+
+          # Edite para definir a pasta de músicas, porta, etc.
+          nano /etc/lms.conf
+          ```
+
+          ### 4. Executar o LMS
+
+          ```bash
+          # O wrapper configura LD_LIBRARY_PATH para as libs Wt4 do pacote
+          /usr/local/bin/lms-run --config /etc/lms.conf
+          ```
+
+          Acesse pelo navegador: **http://localhost:5082**
+
+          Na primeira vez, um assistente guiará a criação da conta admin.
+
+          ---
+
+          ## Inicialização automática (Termux)
+
+          Crie `~/start-lms.sh` **no Termux** (fora do proot):
+
+          ```bash
+          #!/data/data/com.termux/files/usr/bin/bash
+          proot-distro login debian -- /usr/local/bin/lms-run --config /etc/lms.conf
+          ```
+
+          ```bash
+          chmod +x ~/start-lms.sh
+          ```
+
+          Para rodar em background, adicione `&` ao final do comando.
+          Para iniciar com o Termux, use o **Termux:Boot**.
+
+          ---
+
+          ## Conteúdo do pacote
+
+          | Caminho                                    | Descrição                           |
+          |--------------------------------------------|-------------------------------------|
+          | `/usr/local/bin/lms`                       | Binário principal                   |
+          | `/usr/local/bin/lms-run`                   | Wrapper (carrega libs Wt4 bundled)  |
+          | `/usr/local/lib/wt/`                       | Libs Wt4 (não estão no Debian)      |
+          | `/usr/local/share/lms/approot/`            | Recursos da interface web           |
+          | `/usr/local/share/lms/docroot/`            | Arquivos estáticos                  |
+          | `/usr/local/share/lms/lms-termux.conf`     | Config pré-ajustada para Termux     |
+          | `/usr/local/share/lms/termux-install-deps.sh` | Script de instalação de deps     |
+          | `/usr/local/share/Wt/resources/`           | Recursos do framework Wt            |
+
+          ---
+
+          ## Notas
+
+          - As libs do Wt4 estão **incluídas** no pacote (o Wt4 não está
+            nos repositórios do Debian).
+          - O Wt4 é carregado via `LD_LIBRARY_PATH` pelo wrapper `lms-run`.
+          - O LMS **não** usa systemd — inicie-o diretamente pelo comando acima.
+          - Logs são exibidos no stdout/stderr por padrão
+            (`log-file = ""` no `lms.conf`).
+          README
+
+      # ── 7. Empacotar tudo em um tarball ───────────────────────────────────
+      - name: 🗜️ Empacotar artefato
+        run: |
+          tar czf "lms-arm64-debian-${{ env.DEBIAN_CODENAME }}.tar.gz" \
+            --exclude='*.a'  \
+            --exclude='*.la' \
+            -C "${{ github.workspace }}/output" \
+            .
+
+          echo "=== Conteúdo do tarball ==="
+          tar tzf "lms-arm64-debian-${{ env.DEBIAN_CODENAME }}.tar.gz" | head -40
+          echo "..."
+          echo ""
+          echo "=== Tamanho ==="
+          ls -lh "lms-arm64-debian-${{ env.DEBIAN_CODENAME }}.tar.gz"
+
+      # ── 8. Publicar artefato no GitHub Actions ────────────────────────────
+      - name: ⬆️ Publicar artefato
         uses: actions/upload-artifact@v4
         with:
-          name: lms-arm64
-          path: artifacts/lms-arm64.tar.gz
+          name: lms-arm64-debian-${{ env.DEBIAN_CODENAME }}-${{ github.sha }}
+          path: lms-arm64-debian-${{ env.DEBIAN_CODENAME }}.tar.gz
+          retention-days: 60
+          # Já está comprimido com gzip, não recomprimir
+          compression-level: 0
