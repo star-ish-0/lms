@@ -1,205 +1,61 @@
-name: Build LMS for ARM64 (Termux / proot-distro Debian)
+name: Build LMS for ARM64
 
-# Dispara manualmente via Actions → "Run workflow"
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Permite iniciar manualmente pela aba Actions
 
 jobs:
   build:
-    # Runner ARM64 nativo — gratuito para repositórios públicos
-    runs-on: ubuntu-24.04-arm
-
-    # Roda dentro de um container Debian Trixie puro (compatível com proot-distro)
-    container:
-      image: debian:trixie
-
+    runs-on: ubuntu-latest
     steps:
-      # ------------------------------------------------------------------ #
-      # 1. Dependências de build                                             #
-      # ------------------------------------------------------------------ #
-      - name: Install build dependencies
-        run: |
-          set -eux
-          apt-get update -qq
-          apt-get install -y --no-install-recommends \
-            git cmake ninja-build build-essential pkg-config \
-            ca-certificates wget \
-            \
-            libboost-program-options-dev \
-            libboost-system-dev \
-            libboost-iostreams-dev \
-            \
-            libavutil-dev \
-            libavformat-dev \
-            libswresample-dev \
-            ffmpeg \
-            \
-            libconfig++-dev \
-            libstb-dev \
-            libtag-dev \
-            libpugixml-dev \
-            libarchive-dev \
-            libxxhash-dev \
-            libssl-dev \
-            libsqlite3-dev \
-            zlib1g-dev \
-            libpam0g-dev
+      - name: Checkout repositório
+        uses: actions/checkout@v4
 
-      # ------------------------------------------------------------------ #
-      # 2. Compilar Wt 4.12.1 a partir do fonte                             #
-      #    (não está nos repositórios Debian; precisa ser compilado)         #
-      # ------------------------------------------------------------------ #
-      - name: Build Wt 4.12.1 from source
-        run: |
-          set -eux
-          WT_VERSION="4.12.1"
-          cd /tmp
+      - name: Compilar no container Debian ARM64 emulado
+        uses: uraimo/run-on-arch-action@v3
+        with:
+          arch: aarch64
+          distro: bookworm
+          githubToken: ${{ github.token }}
+          setup: |
+            mkdir -p "${PWD}/artifacts"
+          dockerRunArgs: |
+            --volume "${PWD}/artifacts:/artifacts"
+          run: |
+            # Instalar ferramentas e bibliotecas de desenvolvimento no Debian emulado
+            apt-get update && apt-get install -y \
+              build-essential cmake git libboost-program-options-dev \
+              libboost-system-dev libboost-thread-dev libboost-filesystem-dev \
+              libboost-date-time-dev libavutil-dev libavformat-dev libswresample-dev \
+              ffmpeg libconfig++-dev libstb-dev libtag-dev libpugixml-dev \
+              libgtest-dev libarchive-dev libxxhash-dev libssl-dev zlib1g-dev \
+              libgraphicsmagick++1-dev libpstreams-dev
 
-          wget -q "https://github.com/emweb/wt/archive/refs/tags/${WT_VERSION}.tar.gz" \
-               -O wt.tar.gz
-          tar xf wt.tar.gz
-          cd "wt-${WT_VERSION}"
-          mkdir build && cd build
+            # 1. Compilar Wt4
+            git clone --depth 1 https://github.com/emweb/wt.git
+            cd wt
+            mkdir build_wt && cd build_wt
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DSHARED_LIBS=ON
+            make -j$(nproc)
+            make install
+            ldconfig
+            cd ../.. && rm -rf wt
 
-          cmake .. -GNinja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/opt/wt \
-            -DBUILD_EXAMPLES=OFF \
-            -DENABLE_LIBWTTEST=OFF \
-            -DENABLE_LIBWTDBO=ON \
-            -DENABLE_SQLITE=ON \
-            -DENABLE_POSTGRES=OFF \
-            -DENABLE_MYSQL=OFF \
-            -DENABLE_MSSQLSERVER=OFF \
-            -DCONNECTOR_HTTP=ON \
-            -DCONNECTOR_FCGI=OFF \
-            -DENABLE_SSL=ON
+            # 2. Compilar LMS
+            git clone https://github.com/epoupon/lms.git
+            cd lms
+            mkdir build_lms && cd build_lms
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_UNITY_BUILD=ON -DCMAKE_INSTALL_PREFIX=/usr
+            make -j$(nproc)
+            
+            # Instalar em um diretório temporário para gerar o pacote
+            mkdir -p /tmp/lms-package
+            make install DESTDIR=/tmp/lms-package
+            
+            # Gerar tarball mantendo a estrutura de pastas do sistema (/usr/bin, /usr/share, /etc...)
+            tar -czvf /artifacts/lms-arm64.tar.gz -C /tmp/lms-package .
 
-          ninja -j"$(nproc)"
-          ninja install
-
-      # ------------------------------------------------------------------ #
-      # 3. Clonar e compilar LMS (master mais recente)                      #
-      # ------------------------------------------------------------------ #
-      - name: Clone LMS source
-        run: |
-          git clone --depth=1 https://github.com/epoupon/lms.git /tmp/lms
-
-      - name: Build LMS
-        run: |
-          set -eux
-          cd /tmp/lms
-          mkdir build && cd build
-
-          cmake .. -GNinja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_UNITY_BUILD=ON \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=TRUE \
-            -DCMAKE_INSTALL_PREFIX=/opt/lms \
-            -DCMAKE_PREFIX_PATH=/opt/wt \
-            -DENABLE_TESTS=OFF
-
-          ninja -j"$(nproc)"
-          ninja install
-
-      # ------------------------------------------------------------------ #
-      # 4. Montar pacote auto-contido                                       #
-      #    Binários LMS + libs Wt (únicas não disponíveis no apt)           #
-      #    + recursos Wt + configuração padrão                              #
-      # ------------------------------------------------------------------ #
-      - name: Package LMS bundle
-        run: |
-          set -eux
-          PKG=/tmp/lms-bundle
-
-          # Estrutura do bundle
-          mkdir -p "$PKG/bin" "$PKG/lib" "$PKG/share" "$PKG/wt-resources"
-
-          # Binários LMS
-          cp -a /opt/lms/bin/*   "$PKG/bin/"
-          cp -a /opt/lms/share/  "$PKG/share/"
-
-          # Libs Wt (não empacotadas no Debian → precisam vir no bundle)
-          cp -P /opt/wt/lib/libwt*.so*       "$PKG/lib/"
-
-          # Recursos do Wt (templates CSS/JS internos do framework)
-          cp -a /opt/wt/share/Wt             "$PKG/wt-resources/"
-
-          # Config padrão editável
-          cp /opt/lms/share/lms/lms.conf     "$PKG/lms.conf.default"
-
-          # ----- Script de inicialização -----
-          cat > "$PKG/run-lms.sh" << 'RUNSCRIPT'
-#!/bin/bash
-# Inicializa o LMS dentro do proot-distro Debian.
-# Edite /etc/lms.conf antes de executar.
-
-BUNDLE_DIR="$(dirname "$(readlink -f "$0")")"
-export LD_LIBRARY_PATH="$BUNDLE_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
-# Se ainda não existe config do usuário, copia o padrão
-if [ ! -f /etc/lms.conf ]; then
-  echo "[LMS] Copiando config padrão para /etc/lms.conf ..."
-  cp "$BUNDLE_DIR/lms.conf.default" /etc/lms.conf
-  echo "[LMS] Edite /etc/lms.conf antes de continuar (especialmente 'music-directories')."
-  exit 1
-fi
-
-# Cria diretório de dados se não existir
-mkdir -p /var/lms
-
-exec "$BUNDLE_DIR/bin/lms" \
-  --docroot  "$BUNDLE_DIR/share/lms/docroot;/resources,/css,/images,/js,/favicon.ico" \
-  --approot  "$BUNDLE_DIR/share/lms/approot" \
-  --resources-dir "$BUNDLE_DIR/wt-resources/Wt" \
-  "$@"
-RUNSCRIPT
-          chmod +x "$PKG/run-lms.sh"
-
-          # ----- README rápido -----
-          cat > "$PKG/README.txt" << 'README'
-=== LMS para Termux (proot-distro Debian Trixie) ===
-
-1. Instale as dependências de runtime no proot-distro Debian:
-   apt-get update && apt-get install -y \
-     libboost-program-options1.83.0 \
-     libboost-system1.83.0 \
-     libboost-iostreams1.83.0 \
-     libavutil59 libavformat61 libswresample5 \
-     libconfig++9v5 \
-     libtag1v5 \
-     libpugixml1v5 \
-     libarchive13t64 \
-     libxxhash0 \
-     libssl3 \
-     libsqlite3-0 \
-     libpam0g
-
-2. Extraia este pacote:
-   tar xf lms-arm64-trixie.tar.gz -C /opt/
-   chmod +x /opt/lms-bundle/run-lms.sh
-
-3. (Primeira vez) Execute para gerar o lms.conf padrão:
-   /opt/lms-bundle/run-lms.sh
-
-4. Edite /etc/lms.conf conforme necessário e execute novamente.
-
-5. Acesse via browser: http://localhost:5082
-README
-
-          # Criar tarball final
-          cd /tmp
-          tar czf /tmp/lms-arm64-trixie.tar.gz lms-bundle/
-
-          echo "=== Conteúdo do bundle ==="
-          tar tf /tmp/lms-arm64-trixie.tar.gz | head -40
-
-      # ------------------------------------------------------------------ #
-      # 5. Upload do artefato                                               #
-      # ------------------------------------------------------------------ #
-      - name: Upload artifact
+      - name: Fazer upload do binário compilado
         uses: actions/upload-artifact@v4
         with:
-          name: lms-arm64-trixie
-          path: /tmp/lms-arm64-trixie.tar.gz
-          retention-days: 14
+          name: lms-arm64
+          path: artifacts/lms-arm64.tar.gz
