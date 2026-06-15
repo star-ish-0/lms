@@ -83,7 +83,7 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build wget ca-certificates \
-            libboost-dev libboost-program-options-dev libboost-thread-dev \
+            libboost-all-dev \
             libssl-dev libsqlite3-dev zlib1g-dev
 
           # Baixar e extrair o fonte do Wt4
