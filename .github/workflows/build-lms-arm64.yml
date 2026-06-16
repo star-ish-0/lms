@@ -135,7 +135,7 @@ jobs:
 
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build \
+            build-essential cmake ninja-build file \
             libboost-all-dev \
             libavutil-dev libavformat-dev libswresample-dev ffmpeg \
             libconfig++-dev libstb-dev libtag-dev libpugixml-dev \
