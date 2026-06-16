@@ -136,7 +136,7 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build \
-            libboost-program-options-dev libboost-system-dev \
+            libboost-all-dev \
             libavutil-dev libavformat-dev libswresample-dev ffmpeg \
             libconfig++-dev libstb-dev libtag-dev libpugixml-dev \
             libarchive-dev libxxhash-dev libssl-dev libsqlite3-dev \
@@ -241,6 +241,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             libboost-program-options-dev \
             libboost-system-dev \
+            libboost-iostreams-dev \
             libavutil-dev libavformat-dev libswresample-dev \
             ffmpeg \
             libconfig++-dev \
