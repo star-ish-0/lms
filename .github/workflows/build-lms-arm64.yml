@@ -194,6 +194,14 @@ jobs:
             debian:${{ env.DEBIAN_CODENAME }} \
             bash /build-lms.sh
 
+      # ── 5b. Corrigir ownership ──────────────────────────────────────────
+      #  O container Docker roda como root, então os arquivos em /output
+      #  ficam com dono root:root. A etapa seguinte roda como usuário
+      #  "runner" (não-root) e precisa escrever novos arquivos ali.
+      - name: 🔧 Corrigir ownership de /output
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}/output"
+
       # ── 6. Gerar arquivos de suporte para Termux ──────────────────────────
       - name: 📝 Gerar arquivos de suporte para Termux
         run: |
